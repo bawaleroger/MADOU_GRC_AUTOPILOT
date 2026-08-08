@@ -1,226 +1,210 @@
 
 import streamlit as st
-import io, os, json
-from datetime import datetime, timedelta
-from pypdf import PdfReader
-from docx import Document
-import openpyxl
-from openpyxl.styles import Font, PatternFill
-from pptx import Presentation
+import json
+import os
+from datetime import datetime
+from io import BytesIO
 
-st.set_page_config(page_title="MADOU V3 - CABINET AUTONOME COMPLET", page_icon="🛡️", layout="wide")
+# ===================== CONFIG =====================
+st.set_page_config(
+    page_title="MADOU GRC AUTOPILOT",
+    page_icon="🛡️",
+    layout="wide"
+)
 
-# --- ETAT GLOBAL ---
-if "knowledge" not in st.session_state:
-    st.session_state.knowledge = {
-        "normes": [], "rapports": [], "modeles_cc": [], "offres_tech": [], "offres_fin": [], "templates": []
-    }
-if "phase" not in st.session_state:
-    st.session_state.phase = 0
+# ===================== GOOGLE DRIVE SYNC =====================
+# Tentative de connexion Drive - si secrets présents
+DRIVE_AVAILABLE = False
+drive_service = None
 
-# --- SIDEBAR V3 - NOURRISSAGE UNIVERSEL ---
-st.sidebar.title("🛡️ MADOU V3 - CABINET AUTONOME")
-st.sidebar.caption("50 ans d'expertise - Auto-apprenant")
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+
+    if "GDRIVE_CREDENTIALS_JSON" in st.secrets and "GDRIVE_FOLDER_ID" in st.secrets:
+        creds_dict = dict(st.secrets["GDRIVE_CREDENTIALS_JSON"])
+        SCOPES = ['https://www.googleapis.com/auth/drive']
+        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        drive_service = build('drive', 'v3', credentials=creds)
+        GDRIVE_FOLDER_ID = st.secrets["GDRIVE_FOLDER_ID"]
+        DRIVE_AVAILABLE = True
+except Exception as e:
+    DRIVE_AVAILABLE = False
+    drive_error = str(e)
+
+def save_to_drive(data_dict, filename="knowledge_base.json"):
+    """Sauvegarde la base dans Drive"""
+    if not DRIVE_AVAILABLE:
+        return False, "Drive non configuré"
+    try:
+        # Chercher si fichier existe déjà
+        query = f"name='{filename}' and '{GDRIVE_FOLDER_ID}' in parents and trashed=false"
+        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+        files = results.get('files', [])
+
+        json_bytes = json.dumps(data_dict, ensure_ascii=False, indent=2).encode('utf-8')
+        media = MediaIoBaseUpload(BytesIO(json_bytes), mimetype='application/json')
+
+        if files:
+            # Update
+            file_id = files[0]['id']
+            drive_service.files().update(fileId=file_id, media_body=media).execute()
+            return True, "Mis à jour dans Drive"
+        else:
+            # Create
+            file_metadata = {'name': filename, 'parents': [GDRIVE_FOLDER_ID]}
+            drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            return True, "Créé dans Drive"
+    except Exception as ex:
+        return False, str(ex)
+
+def load_from_drive(filename="knowledge_base.json"):
+    """Charge la base depuis Drive"""
+    if not DRIVE_AVAILABLE:
+        return None
+    try:
+        query = f"name='{filename}' and '{GDRIVE_FOLDER_ID}' in parents and trashed=false"
+        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+        files = results.get('files', [])
+        if not files:
+            return None
+        file_id = files[0]['id']
+        request = drive_service.files().get_media(fileId=file_id)
+        fh = BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        fh.seek(0)
+        return json.loads(fh.read().decode('utf-8'))
+    except:
+        return None
+
+# ===================== SESSION STATE =====================
+if 'knowledge' not in st.session_state:
+    # Essayer de charger depuis Drive au démarrage
+    loaded = load_from_drive() if DRIVE_AVAILABLE else None
+    st.session_state.knowledge = loaded if loaded else {}
+
+if 'drive_loaded' not in st.session_state:
+    st.session_state.drive_loaded = False
+    if DRIVE_AVAILABLE and not st.session_state.knowledge:
+        # Si vide, re-essaye une fois
+        from_drive = load_from_drive()
+        if from_drive:
+            st.session_state.knowledge = from_drive
+
+# ===================== UI =====================
+st.sidebar.title("🧠 NOURRIR L'AGENT - BOUTON UNIQUE")
+st.sidebar.write("L'agent accepte tout et classe tout seul")
+
+# Drive status
+if DRIVE_AVAILABLE:
+    st.sidebar.success(f"✅ Drive connecté - Sync auto active\n{GDRIVE_FOLDER_ID[:15]}...")
+else:
+    st.sidebar.warning("⚠️ Drive non connecté - Mode local")
+    if 'drive_error' in locals():
+        st.sidebar.caption(f"Erreur: {drive_error}")
+
 st.sidebar.divider()
 
-st.sidebar.subheader("🧠 NOURRIR L'AGENT - BOUTON UNIQUE")
-st.sidebar.markdown("L'agent accepte tout et classe tout seul")
-nourrir_files = st.sidebar.file_uploader(
+uploaded_file = st.sidebar.file_uploader(
     "Glisse ici : Normes, Rapports d'audit, Modèles CC, Offres Tech/Fin, Templates",
-    type=["pdf","docx","xlsx","pptx","txt"], accept_multiple_files=True, key="nourrir_v3"
+    type=['pdf','docx','xlsx','pptx','txt','json'],
+    help="200MB par fichier"
 )
-if nourrir_files:
-    for f in nourrir_files:
-        name = f.name.lower()
-        if "27001" in name or "27002" in name or "ebios" in name or "nist" in name or "pci" in name or "iso" in name or "rgpd" in name:
-            st.session_state.knowledge["normes"].append(f.name)
-        elif "rapport" in name or "audit" in name:
-            st.session_state.knowledge["rapports"].append(f.name)
-        elif "cahier" in name or "cdc" in name:
-            st.session_state.knowledge["modeles_cc"].append(f.name)
-        elif "offre" in name and "tech" in name:
-            st.session_state.knowledge["offres_tech"].append(f.name)
-        elif "offre" in name and "fin" in name:
-            st.session_state.knowledge["offres_fin"].append(f.name)
-        else:
-            st.session_state.knowledge["templates"].append(f.name)
-    st.sidebar.success(f"✅ {len(nourrir_files)} docs appris et classés auto !")
 
-with st.sidebar.expander(f"📚 Base de connaissances ({sum(len(v) for v in st.session_state.knowledge.values())} docs)", expanded=False):
-    for k,v in st.session_state.knowledge.items():
-        st.write(f"**{k}**: {len(v)}"); 
-        for doc in v[-3:]: st.caption(f" - {doc}")
+st.sidebar.markdown("---")
+doc_count = len(st.session_state.knowledge)
+st.sidebar.markdown(f"📚 **Base de connaissances ({doc_count} docs)**")
+
+# Liste des docs
+if st.session_state.knowledge:
+    for name, data in st.session_state.knowledge.items():
+        with st.sidebar.expander(f"{name} - {data.get('type','doc')}"):
+            st.json(data)
+
+# Upload logic
+if uploaded_file is not None:
+    try:
+        file_name = uploaded_file.name
+        # Détection simple du type
+        lower = file_name.lower()
+        if "norme" in lower or "iso" in lower or "nca" in lower:
+            type_detected = "Norme"
+        elif "rapport" in lower or "audit" in lower:
+            type_detected = "Rapport Audit"
+        elif "offre" in lower:
+            type_detected = "Offre"
+        elif "modele" in lower or "template" in lower:
+            type_detected = "Modèle"
+        else:
+            type_detected = "Document"
+
+        new_entry = {
+            "name": file_name,
+            "type": type_detected,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "size": uploaded_file.size,
+            "content_preview": f"Fichier {file_name} - {uploaded_file.size} bytes"
+        }
+
+        st.session_state.knowledge[file_name] = new_entry
+        
+        # Sauvegarde auto Drive
+        if DRIVE_AVAILABLE:
+            ok, msg = save_to_drive(st.session_state.knowledge)
+            if ok:
+                st.sidebar.success(f"✅ {file_name} classé en {type_detected} + Sauvé dans Drive")
+            else:
+                st.sidebar.error(f"Sauvé local mais erreur Drive: {msg}")
+        else:
+            st.sidebar.success(f"✅ {file_name} classé en {type_detected} (local)")
+
+    except Exception as e:
+        st.sidebar.error(f"Erreur: {e}")
 
 st.sidebar.divider()
 st.sidebar.subheader("🔌 API Externes (Optionnel)")
-st.sidebar.text_input("OpenAI / Groq API (pour IA générative)", type="password", key="api_llm", placeholder="sk-...")
-st.sidebar.text_input("Shodan / VirusTotal API", type="password", key="api_sec", placeholder="API Key...")
-st.sidebar.text_input("Jira / Notion Webhook", key="api_pm", placeholder="https://...")
-st.sidebar.caption("Si vide, l'agent tourne en mode templates experts offline")
+openai_key = st.sidebar.text_input("OpenAI / Groq API (pour IA générative)", type="password", placeholder="sk-...")
+shodan_key = st.sidebar.text_input("Shodan / VirusTotal API", type="password", placeholder="API Key...")
+jira_webhook = st.sidebar.text_input("Jira / Notion Webhook", placeholder="https://...")
 
-st.sidebar.divider()
-ref = st.sidebar.selectbox("Référentiel de certification", ["ISO 27001:2022 - Certif complète", "PCI-DSS v4.0 - Certif complète", "ISO 42001:2023", "SOC2 Type II", "HDS", "ISO 22301"])
-mode = st.sidebar.radio("Type mission", ["Conformité / Audit", "Certification Bout-en-Bout", "Formation Sensibilisation"])
+# ===================== MAIN =====================
+st.title("🛡️ MADOU GRC AUTOPILOT")
 
-# --- FONCTIONS GENERATION FICHIERS REELS ---
-def gen_docx(titre, sections):
-    doc = Document()
-    doc.add_heading(titre, 0)
-    for h, p in sections:
-        doc.add_heading(h, 1)
-        doc.add_paragraph(p)
-    out = io.BytesIO(); doc.save(out); return out.getvalue()
+if not st.session_state.knowledge:
+    st.info("👈 Commence par nourrir l'agent à gauche. Glisse un document, il sera auto-classé et sauvegardé dans ton Drive.")
+    if DRIVE_AVAILABLE:
+        st.success(f"Drive connecté: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
+else:
+    st.success(f"Agent nourri avec {len(st.session_state.knowledge)} documents")
 
-def gen_xlsx(sheet_name, headers, rows):
-    wb = openpyxl.Workbook(); ws = wb.active; ws.title=sheet_name
-    for c,h in enumerate(headers,1): 
-        cell=ws.cell(row=1,column=c,value=h); cell.font=Font(bold=True); cell.fill=PatternFill(start_color="0B5FFF", end_color="0B5FFF", fill_type="solid")
-    for r,row in enumerate(rows,2):
-        for c,val in enumerate(row,1): ws.cell(row=r,column=c,value=val)
-    out=io.BytesIO(); wb.save(out); return out.getvalue()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Documents", len(st.session_state.knowledge))
+    col2.metric("Drive", "Connecté ✅" if DRIVE_AVAILABLE else "Local")
+    col3.metric("Dernier ajout", list(st.session_state.knowledge.values())[-1]['date'] if st.session_state.knowledge else "-")
 
-def gen_pptx(titre, slides_data):
-    prs = Presentation()
-    s0 = prs.slides.add_slide(prs.slide_layouts[0]); s0.shapes.title.text=titre; s0.placeholders[1].text="MADOU GRC AUTOPILOT V3\nCabinet Autonome"
-    for title, content in slides_data:
-        s = prs.slides.add_slide(prs.slide_layouts[1]); s.shapes.title.text=title; s.placeholders[1].text=content
-    out=io.BytesIO(); prs.save(out); return out.getvalue()
+    st.subheader("📊 Base de connaissances")
+    st.json(st.session_state.knowledge)
 
-# --- MAIN ---
-st.title(f"🛡️ MADOU GRC AUTOPILOT V3 - CABINET AUTONOME INTÉGRAL")
-st.markdown(f"**{ref} | Mode: {mode} | Pipeline: TDR → Offre → Certification Complète → Formation → Clôture**")
-st.divider()
+    if st.button("🗑️ Vider la base (local + Drive)"):
+        st.session_state.knowledge = {}
+        if DRIVE_AVAILABLE:
+            save_to_drive({})
+        st.rerun()
 
-# PHASE 1 - TDR
-st.header("📥 PHASE 0 - Ingestion TDRs")
-tdrs = st.file_uploader("Dépose TDRs", type=["pdf","docx"], accept_multiple_files=True, key="tdr_v3")
-tdr_text = ""
-if tdrs:
-    for f in tdrs:
-        try:
-            if f.name.endswith(".pdf"):
-                reader = PdfReader(io.BytesIO(f.getbuffer()))
-                tdr_text += " ".join([(p.extract_text() or "") for p in reader.pages[:3]])
-            else:
-                doc = Document(io.BytesIO(f.getbuffer()))
-                tdr_text += " ".join([p.text for p in doc.paragraphs[:20]])
-        except: pass
-    st.success(f"{len(tdrs)} TDRs analysés - Périmètre détecté: {ref}")
-    
-    col_offre, col_mission = st.columns(2)
-    with col_offre:
-        st.subheader("💰 CAS 1 : Prospection")
-        if st.button("GÉNÉRER OFFRES + CAHIER DES CHARGES COMPLET", type="primary", use_container_width=True):
-            st.session_state.phase = 1
-    with col_mission:
-        st.subheader("🚀 CAS 2 : Mission Déjà Acquise")
-        if st.button("DÉMARRER MISSION - CERTIFICATION BOUT EN BOUT", type="secondary", use_container_width=True):
-            st.session_state.phase = 2
+    if st.button("🔄 Forcer Sync Drive"):
+        if DRIVE_AVAILABLE:
+            ok, msg = save_to_drive(st.session_state.knowledge)
+            st.success(msg) if ok else st.error(msg)
+            reloaded = load_from_drive()
+            if reloaded:
+                st.session_state.knowledge = reloaded
+                st.success("Rechargé depuis Drive")
+        else:
+            st.warning("Drive non configuré")
 
-# PHASE OFFRES
-if st.session_state.phase >=1:
-    st.divider()
-    st.header("💼 PHASE 1 - Offres Auto-Générées (Basées sur tes modèles appris)")
-    c1,c2,c3 = st.columns(3)
-    offre_fin_data = gen_xlsx("Offre Financière", ["Phase","JH","PU","Total","Livrable"], [
-        ["Cadrage + EBIOS RM",3,1300,3900,"Note cadrage + Matrice"],
-        ["Gap Analysis 93 mesures",6,1300,7800,"Rapport écarts"],
-        ["Accompagnement implémentation",10,1300,13000,"Politiques + Procédures"],
-        ["Audit interne + Revue Direction",3,1300,3900,"Rapport audit interne"],
-        ["Accompagnement certification",2,1300,2600,"Dossier certif"],
-        ["TOTAL",24,"",31200,""]
-    ])
-    offre_tech_data = gen_docx("OFFRE TECHNIQUE - Certification ISO 27001:2022", [
-        ("1. Compréhension", f"Analyse TDRs: {tdr_text[:500]}... Besoin: Certification {ref}"),
-        ("2. Méthodologie Certification Complète", "8 phases: Cadrage > Gap Analysis > Risk EBIOS > Traitement > Implémentation > Audit Interne > Revue Direction > Audit Certification"),
-        ("3. Equipe & RACI", "Madou Wale Lead Auditor + Coach TCC - Accompagnement humain"),
-        ("4. Livrables", "Offre fin, Offre tech, CdC, Planning, Questionnaires, Politiques, SOA, Rapports, Slides, Plan formation 12 modules")
-    ])
-    cdc_data = gen_docx("CAHIER DES CHARGES TYPE - Mission Certification", [
-        ("Contexte", "Accompagnement certification bout en bout avec transfert compétences"),
-        ("Exigences", "93 mesures ISO 27001:2022, 5 ateliers EBIOS RM, audit à blanc, formation sensibilisation"),
-        ("Planning", "12 semaines, jalons certification")
-    ])
-    c1.download_button("📥 Offre Financière (XLSX)", offre_fin_data, "Offre_Financiere_V3.xlsx", use_container_width=True)
-    c2.download_button("📥 Offre Technique (DOCX)", offre_tech_data, "Offre_Technique_V3.docx", use_container_width=True)
-    c3.download_button("📥 Cahier des Charges (DOCX)", cdc_data, "CDC_V3.docx", use_container_width=True)
-
-# PHASE CERTIFICATION BOUT EN BOUT - LE COEUR V3
-if st.session_state.phase >=2:
-    st.divider()
-    st.header(f"🏆 PHASE 2 à 9 - CERTIFICATION COMPLÈTE {ref} - BOUT EN BOUT")
-    st.info("Pipeline expert 50 ans : Chaque phase a son questionnaire, ses templates, ses rapports auto-générés. Tu n'as qu'à suivre.")
-
-    tabs = st.tabs(["0.Cadrage","1.Gap Analysis","2.EBIOS RM","3.Plan Traitement","4.Implémentation","5.Audit Interne","6.Revue Direction","7.Certif","8.Formation 12 Modules"])
-
-    with tabs[0]:
-        st.subheader("Phase 0 - Cadrage & Lancement")
-        st.write("Questionnaire de cadrage + Matrice RACI + Planning détaillé")
-        st.download_button("📄 Note Cadrage (DOCX)", gen_docx("Note de Cadrage - Certification", [("Objectifs","Certification ISO 27001:2022 en 12 semaines"),("Périmètre","SI complet, 3 sites"),("Parties prenantes","DSI, RSSI, DPO, COMEX")]), "01_Note_Cadrage.docx")
-        st.download_button("📊 Planning GANTT (XLSX)", gen_xlsx("Planning", ["Phase","Début","Fin","Charge","Livrable"], [["Cadrage","S1","S1","3j","Note"],["Gap","S2","S3","6j","Rapport écarts"]]), "01_Planning.xlsx")
-        st.download_button("🎯 Slides Kick-off (PPTX)", gen_pptx("Kick-off Certification", [("Objectifs","Certification en 12 semaines"),("Méthodo","8 phases éprouvées")]), "01_Kickoff.pptx")
-
-    with tabs[1]:
-        st.subheader("Phase 1 - Gap Analysis 93 Mesures")
-        st.markdown("**Questionnaire expert 127 questions basées sur les modèles que tu as nourris**")
-        q_data = gen_xlsx("Gap Analysis", ["ID","Domaine","Question","Preuve attendue","Conformité","Écart","Action"], [
-            ["A.5.1","Politique","Politique SSI approuvée ?","Politique signée","Non","Majeur","Rédiger politique"],
-            ["A.5.17","Accès","Secrets d'auth en clair ?","Procédure coffre-fort","Partiel","Majeur","Implémenter Vault"],
-            ["A.8.3","Accès priv","Revue accès admin trimestrielle ?","Rapport revue","Non","Majeur","Planifier revue"]
-        ])
-        st.download_button("📥 Questionnaire Gap Analysis (XLSX)", q_data, "02_Gap_Analysis.xlsx")
-        st.download_button("📄 Rapport Ecarts (DOCX)", gen_docx("Rapport Gap Analysis", [("Synthèse","15 non-conformités majeures, 22 mineures"),("Priorités","A.5.17, A.8.3, A.5.23")]), "02_Rapport_Gap.docx")
-
-    with tabs[2]:
-        st.subheader("Phase 2 - EBIOS RM - Analyse Risques")
-        st.download_button("📊 Matrice Risques EBIOS RM (XLSX)", gen_xlsx("EBIOS RM", ["Scénario redouté","Source risque","Chemin attaque","Gravité","Vraisemblance","Risque"], [["Vol données clients","Cybercriminel","Phishing > VPN","4","3","12 - Critique"]]), "03_EBIOS_RM.xlsx")
-
-    with tabs[3]:
-        st.subheader("Phase 3 - Plan Traitement Risques + SOA")
-        st.download_button("📄 SOA (Statement of Applicability)", gen_docx("SOA ISO 27001:2022", [("Justification","93 mesures applicables"),("Exclusions","A.8.28 non applicable")]), "04_SOA.docx")
-        st.download_button("📊 Plan Traitement (XLSX)", gen_xlsx("Plan Traitement", ["Risque","Mesure","Resp","Delai","Budget"], [["R1","MFA + Vault","DSI","M1","5k€"]]), "04_Plan_Traitement.xlsx")
-
-    with tabs[4]:
-        st.subheader("Phase 4 - Implémentation - Politiques & Procédures")
-        st.write("L'agent génère 23 politiques basées sur tes modèles")
-        st.download_button("📚 Pack Politiques (DOCX)", gen_docx("PSSI - Politique SSI", [("Objet","Politique SSI Groupe"),("Exigences","93 mesures")]), "05_PSSI.docx")
-
-    with tabs[5]:
-        st.subheader("Phase 5 - Audit Interne")
-        st.download_button("📋 Plan Audit Interne (XLSX)", gen_xlsx("Plan Audit", ["Date","Auditeur","Domaine","Checklist"], [["S10","Madou","A.5","127 Q"]]), "06_Plan_Audit_Interne.xlsx")
-        st.download_button("📄 Rapport Audit Interne (DOCX)", gen_docx("Rapport Audit Interne", [("Constats","5 NC mineures résiduelles")]), "06_Rapport_Audit_Interne.docx")
-
-    with tabs[6]:
-        st.subheader("Phase 6 - Revue de Direction")
-        st.download_button("🎯 Slides Revue Direction (PPTX)", gen_pptx("Revue de Direction", [("Bilan SMSI","KPI, NC, Risques"),("Décisions","Budget, Ressources")]), "07_Revue_Direction.pptx")
-
-    with tabs[7]:
-        st.subheader("Phase 7 - Dossier Certification")
-        st.download_button("📦 Dossier Certification Complet (DOCX)", gen_docx("Dossier Certification", [("Documents","SOA, Rapports, Preuves"),("Attestation","Prêt pour auditeur certificateur")]), "08_Dossier_Certif.docx")
-
-    with tabs[8]:
-        st.header("🎓 MODULE FORMATION SENSIBILISATION & CULTURE CYBER - 12 Modules Interactifs (360°)")
-        modules = [
-            "M1: Mots de passe & Authentification (MFA, Vault)",
-            "M2: Phishing & Ingénierie Sociale (Simulations)",
-            "M3: Wi-Fi Public & Sécurité Nomade",
-            "M4: Sécurité Mobile (BYOD)",
-            "M5: Confidentialité & RGPD au quotidien",
-            "M6: Clean Desk & Classification",
-            "M7: Réseaux Sociaux & OSINT",
-            "M8: Rançongiciel - Que faire ?",
-            "M9: Signalement incident",
-            "M10: Sécurité Cloud & Partage",
-            "M11: Physique & Contrôle accès",
-            "M12: Culture Cyber - Quiz final & Attestation"
-        ]
-        for m in modules:
-            with st.expander(m):
-                st.write(f"Contenu: Vidéo 5min + Quiz + Fiche réflexe + Attestation")
-                if st.button(f"Générer support {m[:2]}", key=m):
-                    st.success("Slides + Quiz générés")
-        
-        st.download_button("🎓 Pack Formation Complet 12 Modules (PPTX)", gen_pptx("Formation Culture Cyber - 12 Modules", [(m, "Objectif + Risque + Bonnes pratiques + Quiz") for m in modules[:4]]), "09_Pack_Formation_12_Modules.pptx", use_container_width=True)
-
-st.divider()
-st.caption("V3 Cabinet Autonome - Auto-nourrissant, Certification bout-en-bout, Formation 360°, API Ready. Développé par Madou Wale - 50 ans d'expertise codifiée.")
+st.markdown("---")
+st.caption("V3.2 - Cloud Memory - MADOU AUTOPILOT - Drive auto-sync actif")
