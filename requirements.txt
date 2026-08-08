@@ -1,7 +1,0 @@
-streamlit
-pypdf
-python-docx
-openpyxl
-python-pptx
-fpdf2
-requests
